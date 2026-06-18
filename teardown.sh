@@ -25,7 +25,8 @@ echo "  ACR            : $ACR_NAME"
 echo "  Delete RG      : $DELETE_RG"
 echo ""
 read -rp "  Proceed? (y/N) " confirm
-[[ "${confirm,,}" == "y" ]] || { echo "Aborted."; exit 0; }
+confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]')
+[[ "$confirm" == "y" ]] || { echo "Aborted."; exit 0; }
 echo ""
 
 # ── Web App ───────────────────────────────────────────────────────────────────
