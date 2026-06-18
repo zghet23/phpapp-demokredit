@@ -1,298 +1,340 @@
 <?php
 declare(strict_types=1);
 
-// ── Structured JSON logger with Datadog trace correlation ────────────────────
-function logJson(string $level, string $message, array $context = []): void
-{
-    $traceId = null;
-    $spanId  = null;
+// ── Autoloader ────────────────────────────────────────────────────────────────
+spl_autoload_register(static function (string $class): void {
+    $file = __DIR__ . '/src/' . $class . '.php';
+    if (file_exists($file)) require_once $file;
+});
 
-    if (extension_loaded('ddtrace')) {
-        $traceId = \DDTrace\logs_correlation_trace_id();
-        $span    = \DDTrace\active_span();
-        if ($span !== null) {
-            $spanId = $span->hexId();
-        }
-    }
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+Logger::init();
 
-    $entry = array_merge([
-        'timestamp'   => date('c'),
-        'level'       => strtoupper($level),
-        'message'     => $message,
-        'service'     => getenv('DD_SERVICE')  ?: 'kredit-plus',
-        'env'         => getenv('DD_ENV')       ?: 'local',
-        'version'     => getenv('DD_VERSION')   ?: '1.0.0',
-        'dd.trace_id' => $traceId,
-        'dd.span_id'  => $spanId,
-    ], $context);
+$db   = new Db();
+$http = new Http();
 
-    fwrite(STDOUT, json_encode($entry) . PHP_EOL);
-}
+// ── Router ────────────────────────────────────────────────────────────────────
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$body   = (array)(json_decode(file_get_contents('php://input') ?: '{}', true) ?? []);
 
-function jsonResponse(array $data, int $status = 200): void
+// Helper: return JSON
+function respond(mixed $data, int $status = 200): never
 {
     http_response_code($status);
     header('Content-Type: application/json');
-    echo json_encode($data, JSON_PRETTY_PRINT);
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
 }
 
-// ── Manual span helpers (no-op when ddtrace not loaded) ──────────────────────
-function spanStart(string $name, array $meta = []): ?object
+// Helper: wrap handler in a try/catch
+function safe(callable $fn): void
 {
-    if (!extension_loaded('ddtrace')) {
-        return null;
-    }
-    $span = \DDTrace\start_span();
-    $span->name = $name;
-    foreach ($meta as $k => $v) {
-        $span->meta[$k] = (string) $v;
-    }
-    return $span;
-}
-
-function spanFinish(?object $span): void
-{
-    if ($span !== null) {
-        \DDTrace\close_span();
+    try {
+        $fn();
+    } catch (\Throwable $e) {
+        Logger::exception($e, 'Request handler exception');
+        respond(['error' => $e->getMessage(), 'type' => get_class($e)], max(500, $e->getCode() ?: 500));
     }
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
-function handleHealth(): void
-{
-    logJson('info', 'Health check OK');
-    jsonResponse([
-        'status'    => 'ok',
-        'service'   => getenv('DD_SERVICE') ?: 'kredit-plus',
-        'version'   => getenv('DD_VERSION') ?: '1.0.0',
-        'timestamp' => date('c'),
-    ]);
+// UI
+if ($method === 'GET' && ($path === '/' || $path === '')) {
+    serveUi();
+    exit;
 }
 
-function handleLoanApply(): void
-{
-    $root = spanStart('loan.apply', ['resource.name' => 'POST /loan/apply']);
-
-    $applicantId = 'APP-' . rand(1000, 9999);
-    $amount      = rand(5000, 50000);
-    $currency    = 'MXN';
-
-    if ($root) {
-        $root->meta['loan.applicant_id'] = $applicantId;
-        $root->meta['loan.amount']       = (string) $amount;
-        $root->meta['loan.currency']     = $currency;
-    }
-
-    logJson('info', 'Loan application received', [
-        'applicant_id' => $applicantId,
-        'amount'       => $amount,
-        'currency'     => $currency,
-    ]);
-
-    // Simulate credit bureau HTTP call
-    $http = spanStart('http.request', [
-        'http.url'     => 'https://bureau.internal/score',
-        'http.method'  => 'GET',
-        'span.kind'    => 'client',
-        'peer.service' => 'credit-bureau',
-    ]);
-    usleep(rand(80000, 200000));
-    $creditScore = rand(450, 900);
-    if ($http) {
-        $http->meta['http.status_code'] = '200';
-        $http->meta['credit.score']     = (string) $creditScore;
-    }
-    spanFinish($http);
-
-    logJson('info', 'Credit score retrieved', [
-        'applicant_id' => $applicantId,
-        'credit_score' => $creditScore,
-    ]);
-
-    // Simulate DB INSERT
-    $db = spanStart('mysql.query', [
-        'db.type'      => 'mysql',
-        'db.operation' => 'INSERT',
-        'db.name'      => 'kredit',
-        'db.statement' => 'INSERT INTO loan_applications (applicant_id, amount, score) VALUES (?, ?, ?)',
-        'span.kind'    => 'client',
-        'peer.service' => 'kredit-db',
-    ]);
-    usleep(rand(20000, 60000));
-    spanFinish($db);
-
-    $approved = $creditScore >= 650;
-
-    if ($root) {
-        $root->meta['loan.approved']     = $approved ? 'true' : 'false';
-        $root->meta['loan.credit_score'] = (string) $creditScore;
-        $root->meta['loan.decision']     = $approved ? 'APPROVED' : 'DENIED';
-    }
-
-    logJson($approved ? 'info' : 'warn', 'Loan decision made', [
-        'applicant_id' => $applicantId,
-        'approved'     => $approved,
-        'credit_score' => $creditScore,
-    ]);
-
-    spanFinish($root);
-
-    jsonResponse([
-        'applicant_id' => $applicantId,
-        'amount'       => $amount,
-        'currency'     => $currency,
-        'credit_score' => $creditScore,
-        'status'       => $approved ? 'APPROVED' : 'DENIED',
-    ]);
+// Health
+if ($path === '/health') {
+    Logger::info('Health check');
+    respond(['status' => 'ok', 'service' => getenv('DD_SERVICE') ?: 'kredit-plus', 'version' => getenv('DD_VERSION') ?: '1.0.0', 'db' => $db->isConnected(), 'timestamp' => date('c')]);
 }
 
-function handleLoanScore(): void
-{
-    $root = spanStart('loan.score', ['resource.name' => 'GET /loan/score']);
-
-    $customerId = $_GET['customer_id'] ?? ('CUST-' . rand(100, 999));
-    if ($root) {
-        $root->meta['customer.id'] = $customerId;
-    }
-
-    logJson('info', 'Credit scoring requested', ['customer_id' => $customerId]);
-
-    $fraud = spanStart('model.fraud_check', ['model.name' => 'fraud-v2', 'span.kind' => 'internal']);
-    usleep(rand(40000, 100000));
-    $fraudRisk = round(lcg_value() * 0.4, 3);
-    if ($fraud) {
-        $fraud->meta['fraud.risk_score'] = (string) $fraudRisk;
-    }
-    spanFinish($fraud);
-
-    $income = spanStart('model.income_verification', ['model.name' => 'income-v1', 'span.kind' => 'internal']);
-    usleep(rand(60000, 130000));
-    $incomeVerified = (rand(0, 1) === 1);
-    if ($income) {
-        $income->meta['income.verified'] = $incomeVerified ? 'true' : 'false';
-    }
-    spanFinish($income);
-
-    $finalScore = rand(500, 850);
-    if ($root) {
-        $root->meta['score.value']      = (string) $finalScore;
-        $root->meta['score.fraud_risk'] = (string) $fraudRisk;
-    }
-
-    logJson('info', 'Scoring complete', [
-        'customer_id'     => $customerId,
-        'score'           => $finalScore,
-        'fraud_risk'      => $fraudRisk,
-        'income_verified' => $incomeVerified,
-    ]);
-
-    spanFinish($root);
-
-    jsonResponse([
-        'customer_id'     => $customerId,
-        'score'           => $finalScore,
-        'fraud_risk'      => $fraudRisk,
-        'income_verified' => $incomeVerified,
-        'tier'            => $finalScore >= 750 ? 'PRIME' : ($finalScore >= 620 ? 'STANDARD' : 'SUBPRIME'),
-    ]);
+// ── Log generation ───────────────────────────────────────────────────────────
+if ($method === 'POST' && preg_match('#^/api/log/(\w+)$#', $path, $m)) {
+    safe(function() use ($m) {
+        $level   = $m[1];
+        $message = "Log level {$level} generated from APM demo";
+        $ctx     = ['source' => 'ui', 'level_requested' => $level];
+        match ($level) {
+            'debug'     => Logger::debug($message, $ctx),
+            'info'      => Logger::info($message, $ctx),
+            'warning'   => Logger::warning($message, $ctx),
+            'error'     => Logger::error($message, $ctx),
+            'critical'  => Logger::critical($message, $ctx),
+            'exception' => (static function() use ($ctx) {
+                try {
+                    throw new \RuntimeException('Simulated exception for APM demo', 500);
+                } catch (\Throwable $e) {
+                    Logger::exception($e, 'Simulated exception triggered from UI');
+                }
+            })(),
+            default     => Logger::info($message, $ctx),
+        };
+        respond(['logged' => true, 'level' => $level, 'message' => $message]);
+    });
 }
 
-function handleLoanSlow(): void
-{
-    $root = spanStart('loan.slow_report', ['resource.name' => 'GET /loan/slow']);
-
-    logJson('warn', 'Slow report generation started — high latency expected');
-
-    // 5 sequential DB reads — classic N+1 problem, great APM demo
-    for ($i = 0; $i < 5; $i++) {
-        $q = spanStart('mysql.query', [
-            'db.type'      => 'mysql',
-            'db.operation' => 'SELECT',
-            'db.name'      => 'kredit',
-            'db.statement' => 'SELECT * FROM loan_history WHERE month = ?',
-        ]);
-        usleep(rand(150000, 300000));
-        spanFinish($q);
-    }
-
-    if ($root) {
-        $root->meta['report.pages'] = '5';
-    }
-    logJson('warn', 'Slow report finished', ['pages_processed' => 5]);
-    spanFinish($root);
-
-    jsonResponse(['status' => 'report_ready', 'pages' => 5]);
+if ($method === 'POST' && $path === '/api/log/batch') {
+    safe(function() {
+        $levels = ['debug','info','info','info','warning','error'];
+        for ($i = 0; $i < 20; $i++) {
+            $level = $levels[array_rand($levels)];
+            Logger::$level("Batch log #{$i} ({$level})", ['batch' => true, 'index' => $i]);
+        }
+        respond(['logged' => 20, 'note' => '20 mixed-level log entries generated']);
+    });
 }
 
-function handleLoanError(): void
-{
-    $root = spanStart('loan.error_demo', ['resource.name' => 'GET /loan/error']);
-    $downstream = null;
+// ── External flows ────────────────────────────────────────────────────────────
+if ($method === 'POST' && preg_match('#^/api/flow/(\w+)$#', $path, $m)) {
+    safe(function() use ($m, $http) {
+        $result = match ($m[1]) {
+            'posts'   => $http->runPostsFlow(),
+            'users'   => $http->runUsersFlow(),
+            'github'  => $http->runGitHubFlow(),
+            'crypto'  => $http->runCryptoFlow(),
+            'httpbin' => $http->runHttpBinFlow(),
+            'quotes'  => $http->runQuotesFlow(),
+            'all'     => $http->runAllFlows(),
+            default   => throw new \InvalidArgumentException("Unknown flow: {$m[1]}"),
+        };
+        respond(['flow' => $m[1], 'result' => $result]);
+    });
+}
 
-    logJson('warn', 'Error simulation endpoint called');
+// ── Database operations ───────────────────────────────────────────────────────
+if ($method === 'POST' && preg_match('#^/api/db/(\S+)$#', $path, $m)) {
+    safe(function() use ($m, $db, $body) {
+        $op     = $m[1];
+        $result = match ($op) {
+            'connection'      => $db->testConnection(),
+            'top-customers'   => $db->topCustomers((int)($body['days'] ?? 30), (int)($body['limit'] ?? 10)),
+            'orders-status'   => $db->ordersByStatus($body['status'] ?? 'pending'),
+            'catalog'         => $db->productCatalog($body['category'] ?? null),
+            'search-reviews'  => $db->searchReviews($body['term'] ?? 'great'),
+            'heavy-report'    => $db->heavyReport(),
+            'create-order'    => $db->createRandomOrder(),
+            default           => throw new \InvalidArgumentException("Unknown DB operation: {$op}"),
+        };
+        respond(['operation' => $op, 'result' => $result]);
+    });
+}
+
+// ── Error simulation ──────────────────────────────────────────────────────────
+if ($method === 'POST' && preg_match('#^/api/error/(\w+(?:-\w+)*)$#', $path, $m)) {
+    safe(function() use ($m, $http) {
+        match ($m[1]) {
+            'timeout'       => $http->simulateTimeout(),
+            'http-500'      => $http->simulateHttp500(),
+            'dns-failure'   => $http->simulateDnsFailure(),
+            'retry-backoff' => respond(['simulation' => 'retry-backoff', 'result' => $http->simulateRetryBackoff()]),
+            default         => throw new \InvalidArgumentException("Unknown error simulation: {$m[1]}"),
+        };
+    });
+}
+
+// 404
+Logger::warning('Route not found', ['path' => $path, 'method' => $method]);
+respond(['error' => 'Not found', 'path' => $path], 404);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI
+// ─────────────────────────────────────────────────────────────────────────────
+function serveUi(): void
+{
+    $service = getenv('DD_SERVICE') ?: 'kredit-plus';
+    $env     = getenv('DD_ENV')     ?: 'local';
+    $version = getenv('DD_VERSION') ?: '1.0.0';
+    header('Content-Type: text/html; charset=utf-8');
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kredit Plus — APM Demo</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #0f1117;
+    --surface: #1a1d2e;
+    --card:    #21253a;
+    --border:  #2e3352;
+    --text:    #e2e8f0;
+    --muted:   #94a3b8;
+    --accent:  #6366f1;
+    --green:   #22c55e;
+    --yellow:  #eab308;
+    --red:     #ef4444;
+    --orange:  #f97316;
+    --blue:    #3b82f6;
+    --purple:  #a855f7;
+  }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; }
+
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+  header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.5px; }
+  .badge { background: var(--accent); color: #fff; font-size: .7rem; font-weight: 600; padding: .2rem .6rem; border-radius: 99px; text-transform: uppercase; }
+  .badge.green { background: var(--green); }
+  .tag { background: var(--card); border: 1px solid var(--border); font-size: .75rem; padding: .2rem .5rem; border-radius: 4px; color: var(--muted); }
+  header .spacer { flex: 1; }
+
+  main { padding: 1.5rem 2rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.25rem; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; }
+  .card h2 { font-size: .85rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 1rem; display: flex; align-items: center; gap: .5rem; }
+  .card h2 .icon { font-size: 1rem; }
+
+  .btn-grid { display: flex; flex-wrap: wrap; gap: .5rem; }
+  button {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    font-size: .8rem; padding: .45rem .9rem; border-radius: 6px; cursor: pointer;
+    transition: all .15s; white-space: nowrap; font-weight: 500;
+  }
+  button:hover { border-color: var(--accent); color: #fff; background: rgba(99,102,241,.15); }
+  button:active { transform: scale(.97); }
+  button.loading { opacity: .6; pointer-events: none; }
+  button.ok   { border-color: var(--green);  color: var(--green); }
+  button.fail { border-color: var(--red);    color: var(--red); }
+
+  button[data-color="debug"]    { border-color: #64748b; }
+  button[data-color="info"]     { border-color: var(--blue); }
+  button[data-color="warning"]  { border-color: var(--yellow); }
+  button[data-color="error"]    { border-color: var(--red); }
+  button[data-color="critical"] { border-color: var(--orange); }
+  button[data-color="exception"]{ border-color: var(--purple); }
+  button[data-color="all"]      { border-color: var(--accent); background: rgba(99,102,241,.12); }
+
+  #response-area { grid-column: 1 / -1; }
+  #response-area h2 { font-size: .85rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .75rem; }
+  #response-box {
+    background: #0a0d18; border: 1px solid var(--border); border-radius: 8px;
+    padding: 1rem; min-height: 180px; max-height: 400px; overflow-y: auto;
+    font-family: 'Fira Code', 'Cascadia Code', monospace; font-size: .78rem; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word; color: #a5f3fc;
+  }
+  #response-box.error-state { color: #fca5a5; }
+  #last-op { font-size: .75rem; color: var(--muted); margin-bottom: .4rem; }
+  .spinner { display: inline-block; animation: spin .6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kredit Plus</h1>
+  <span class="badge">APM Demo</span>
+  <span class="tag">service: {$service}</span>
+  <span class="tag">env: {$env}</span>
+  <span class="tag">v{$version}</span>
+  <span class="spacer"></span>
+  <span id="db-badge" class="badge"></span>
+</header>
+<main>
+
+  <!-- Log Generation -->
+  <div class="card">
+    <h2><span class="icon">📋</span> Log Generation</h2>
+    <div class="btn-grid">
+      <button data-color="debug"     onclick="call('/api/log/debug',    this)">DEBUG</button>
+      <button data-color="info"      onclick="call('/api/log/info',     this)">INFO</button>
+      <button data-color="warning"   onclick="call('/api/log/warning',  this)">WARNING</button>
+      <button data-color="error"     onclick="call('/api/log/error',    this)">ERROR</button>
+      <button data-color="critical"  onclick="call('/api/log/critical', this)">CRITICAL</button>
+      <button data-color="exception" onclick="call('/api/log/exception',this)">EXCEPTION</button>
+      <button data-color="all"       onclick="call('/api/log/batch',    this)">BATCH ×20</button>
+    </div>
+  </div>
+
+  <!-- External Flows -->
+  <div class="card">
+    <h2><span class="icon">🌐</span> External API Flows</h2>
+    <div class="btn-grid">
+      <button onclick="call('/api/flow/posts',   this)">Posts</button>
+      <button onclick="call('/api/flow/users',   this)">Users</button>
+      <button onclick="call('/api/flow/github',  this)">GitHub</button>
+      <button onclick="call('/api/flow/crypto',  this)">Crypto</button>
+      <button onclick="call('/api/flow/httpbin', this)">HTTPBin</button>
+      <button onclick="call('/api/flow/quotes',  this)">Quotes</button>
+      <button data-color="all" onclick="call('/api/flow/all', this)">▶ Run All</button>
+    </div>
+  </div>
+
+  <!-- DB Operations -->
+  <div class="card">
+    <h2><span class="icon">🗄️</span> Database Operations</h2>
+    <div class="btn-grid">
+      <button onclick="call('/api/db/connection',    this)">Test Connection</button>
+      <button onclick="call('/api/db/top-customers', this)">Top Customers</button>
+      <button onclick="callWith('/api/db/orders-status', {status:'pending'}, this)">Orders Pending</button>
+      <button onclick="callWith('/api/db/orders-status', {status:'delivered'}, this)">Orders Delivered</button>
+      <button onclick="call('/api/db/catalog',       this)">Catalog Overview</button>
+      <button onclick="callWith('/api/db/search-reviews', {term:'great'}, this)">Search Reviews 🐢</button>
+      <button onclick="call('/api/db/heavy-report',  this)">Heavy Report 🐢</button>
+      <button data-color="all" onclick="call('/api/db/create-order', this)">Create Order (TX)</button>
+    </div>
+  </div>
+
+  <!-- Error Simulation -->
+  <div class="card">
+    <h2><span class="icon">💥</span> Error Simulation</h2>
+    <div class="btn-grid">
+      <button onclick="call('/api/error/timeout',       this)">Timeout</button>
+      <button onclick="call('/api/error/http-500',      this)">HTTP 500</button>
+      <button onclick="call('/api/error/dns-failure',   this)">DNS Failure</button>
+      <button onclick="call('/api/error/retry-backoff', this)">Retry + Backoff</button>
+    </div>
+  </div>
+
+  <!-- Response -->
+  <div id="response-area" class="card">
+    <h2>Response</h2>
+    <div id="last-op">—</div>
+    <div id="response-box">Hit any button to see the APM-instrumented response here.</div>
+  </div>
+
+</main>
+<script>
+  // Check DB status on load
+  fetch('/api/db/connection', {method:'POST'})
+    .then(r => r.json())
+    .then(d => {
+      const b = document.getElementById('db-badge');
+      b.textContent = d.result?.connected ? '✓ DB' : '✗ DB';
+      b.className   = 'badge ' + (d.result?.connected ? 'green' : '');
+    }).catch(() => {
+      const b = document.getElementById('db-badge');
+      b.textContent = '✗ DB'; b.className = 'badge';
+    });
+
+  async function call(url, btn, body = {}) {
+    const box     = document.getElementById('response-box');
+    const lastOp  = document.getElementById('last-op');
+    const origTxt = btn.textContent;
+    btn.classList.add('loading');
+    btn.textContent = '⏳ ' + origTxt;
+    box.classList.remove('error-state');
+    box.textContent = 'Loading…';
+    lastOp.textContent = 'POST ' + url;
 
     try {
-        $downstream = spanStart('http.request', [
-            'http.url'     => 'https://payments.internal/charge',
-            'http.method'  => 'POST',
-            'span.kind'    => 'client',
-            'peer.service' => 'payments',
-        ]);
-        usleep(50000);
-        throw new \RuntimeException('Payment gateway timeout after 5000ms', 504);
-
-    } catch (\RuntimeException $e) {
-        if ($downstream) {
-            $downstream->meta['error']            = 'true';
-            $downstream->meta['error.message']    = $e->getMessage();
-            $downstream->meta['error.type']       = get_class($e);
-            $downstream->meta['http.status_code'] = '504';
-        }
-        spanFinish($downstream);
-
-        if ($root) {
-            $root->meta['error']         = 'true';
-            $root->meta['error.message'] = $e->getMessage();
-            $root->meta['error.type']    = get_class($e);
-            $root->meta['error.stack']   = $e->getTraceAsString();
-        }
-
-        logJson('error', 'Payment gateway error', [
-            'error.type'    => get_class($e),
-            'error.message' => $e->getMessage(),
-            'error.code'    => $e->getCode(),
-        ]);
-
-        spanFinish($root);
-        jsonResponse(['error' => $e->getMessage(), 'code' => $e->getCode()], 504);
-        return;
+      const res  = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+      const data = await res.json();
+      box.textContent = JSON.stringify(data, null, 2);
+      if (!res.ok) box.classList.add('error-state');
+      btn.classList.remove('loading'); btn.textContent = origTxt;
+    } catch(e) {
+      box.textContent = 'Network error: ' + e.message;
+      box.classList.add('error-state');
+      btn.classList.remove('loading'); btn.textContent = origTxt;
     }
+  }
 
-    spanFinish($root);
-}
-
-// ── Router ────────────────────────────────────────────────────────────────────
-$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
-
-switch ($path) {
-    case '/':
-    case '/health':
-        handleHealth();
-        break;
-    case '/loan/apply':
-        handleLoanApply();
-        break;
-    case '/loan/score':
-        handleLoanScore();
-        break;
-    case '/loan/slow':
-        handleLoanSlow();
-        break;
-    case '/loan/error':
-        handleLoanError();
-        break;
-    default:
-        logJson('warn', 'Route not found', ['path' => $path]);
-        jsonResponse(['error' => 'Not found', 'path' => $path], 404);
+  function callWith(url, body, btn) { call(url, btn, body); }
+</script>
+</body>
+</html>
+HTML;
 }

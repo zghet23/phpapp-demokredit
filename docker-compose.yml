@@ -1,11 +1,8 @@
-# Local dev — solo la imagen de la aplicación.
-# El sidecar de Datadog (datadog/serverless-init) se agrega en Azure Portal.
-#
-# Para probar con trazas en local, define DD_AGENT_HOST apuntando
-# a un Datadog Agent que tengas corriendo, o deja las variables vacías
-# para correr la app sin APM.
+# Local dev — mirrors Azure App Service setup.
+# MySQL is included here; in Azure use Azure Database for MySQL and set DB_HOST.
 
 services:
+
   app:
     build: .
     ports:
@@ -16,6 +13,34 @@ services:
       DD_VERSION: "1.0.0"
       DD_TRACE_ENABLED: "true"
       DD_LOGS_INJECTION: "true"
-      # Apunta a localhost:8126 en Azure (sidecar comparte network namespace)
-      # En local sobreescribe con: DD_TRACE_AGENT_URL=http://<tu-agent-host>:8126
       DD_TRACE_AGENT_URL: ${DD_TRACE_AGENT_URL:-http://localhost:8126}
+      # MySQL connection
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: kredit
+      DB_USER: kredit
+      DB_PASS: kredit
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: kredit
+      MYSQL_USER: kredit
+      MYSQL_PASSWORD: kredit
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ukredit", "-pkredit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql_data:

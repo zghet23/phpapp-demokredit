@@ -1,0 +1,299 @@
+<?php
+declare(strict_types=1);
+
+class Http
+{
+    private string $userAgent  = 'KreditPlus-PHP/1.0';
+    private int    $timeout    = 15;
+    private int    $maxRetries = 3;
+
+    public function __construct()
+    {
+        $this->userAgent = 'KreditPlus-PHP/' . (getenv('DD_VERSION') ?: '1.0.0');
+    }
+
+    // ── Core cURL request ─────────────────────────────────────────────────────
+
+    private function request(string $method, string $url, array $data = []): array
+    {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => $this->timeout,
+            CURLOPT_USERAGENT      => $this->userAgent,
+            CURLOPT_HTTPHEADER     => ['Accept: application/json', 'Content-Type: application/json'],
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+
+        if ($method === 'POST' || $method === 'PUT') {
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        }
+
+        $body  = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
+        curl_close($ch);
+
+        if ($curlErr) throw new \RuntimeException("cURL error: {$curlErr}", 0);
+        if ($status >= 400) throw new \RuntimeException("HTTP {$status} from {$url}", $status);
+
+        return ['status' => $status, 'body' => json_decode((string) $body, true) ?? $body, 'size' => strlen((string) $body)];
+    }
+
+    // ── Instrumented request (wraps each call in an http.client.request span) ─
+
+    private function fetch(string $method, string $url, array $data = [], string $peerService = ''): array
+    {
+        $span = null;
+        if (extension_loaded('ddtrace')) {
+            $span = \DDTrace\start_span();
+            $span->name = 'http.client.request';
+            $span->type = 'http';
+            $span->meta['http.method']  = $method;
+            $span->meta['http.url']     = $url;
+            $span->meta['span.kind']    = 'client';
+            $span->meta['component']    = 'curl';
+            $host = parse_url($url, PHP_URL_HOST) ?? '';
+            $span->meta['out.host']                   = $host;
+            $span->meta['network.destination.name']   = $host;
+            if ($peerService) $span->meta['peer.service'] = $peerService;
+        }
+        $t = microtime(true);
+        try {
+            $r = $this->request($method, $url, $data);
+            if ($span) {
+                $span->meta['http.status_code']   = (string) $r['status'];
+                $span->meta['http.response_size'] = (string) $r['size'];
+                $span->meta['duration_ms']        = (string) round((microtime(true) - $t) * 1000, 2);
+            }
+            return $r;
+        } catch (\Throwable $e) {
+            if ($span) {
+                $span->meta['error']              = 'true';
+                $span->meta['error.message']      = $e->getMessage();
+                $span->meta['http.status_code']   = (string) $e->getCode();
+            }
+            throw $e;
+        } finally {
+            if ($span) \DDTrace\close_span();
+        }
+    }
+
+    // ── Retry with exponential backoff (Polly equivalent) ────────────────────
+
+    private function withRetry(callable $fn): mixed
+    {
+        $attempt = 0;
+        $last    = null;
+        while ($attempt < $this->maxRetries) {
+            try {
+                return $fn();
+            } catch (\Throwable $e) {
+                $last = $e;
+                $attempt++;
+                if ($attempt < $this->maxRetries) {
+                    $delay = (int) pow(2, $attempt); // 2s, 4s
+                    Logger::warning("Request failed — retrying", [
+                        'attempt'       => $attempt,
+                        'retry_delay_s' => $delay,
+                        'error'         => $e->getMessage(),
+                    ]);
+                    sleep($delay);
+                }
+            }
+        }
+        throw $last;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // External flows
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function runPostsFlow(): array
+    {
+        $base = 'https://jsonplaceholder.typicode.com';
+        Logger::info('Posts flow started', ['target' => 'jsonplaceholder.typicode.com']);
+
+        $r1 = $this->fetch('GET',  "{$base}/posts",          [], 'jsonplaceholder');
+        $id = rand(1, 100);
+        $r2 = $this->fetch('GET',  "{$base}/posts/{$id}",    [], 'jsonplaceholder');
+        $r3 = $this->fetch('GET',  "{$base}/posts/{$id}/comments", [], 'jsonplaceholder');
+        $r4 = $this->fetch('POST', "{$base}/posts", ['title' => 'APM Demo', 'body' => 'Generated by kredit-plus', 'userId' => 1], 'jsonplaceholder');
+
+        $result = ['posts_fetched' => count((array)$r1['body']), 'post_title' => $r2['body']['title'] ?? null, 'comments' => count((array)$r3['body']), 'created_id' => $r4['body']['id'] ?? null];
+        Logger::info('Posts flow completed', $result);
+        return $result;
+    }
+
+    public function runUsersFlow(): array
+    {
+        $base = 'https://jsonplaceholder.typicode.com';
+        Logger::info('Users flow started', ['target' => 'jsonplaceholder.typicode.com']);
+
+        $r1 = $this->fetch('GET', "{$base}/users",                [], 'jsonplaceholder');
+        $id = rand(1, 10);
+        $r2 = $this->fetch('GET', "{$base}/users/{$id}",          [], 'jsonplaceholder');
+        $r3 = $this->fetch('GET', "{$base}/users/{$id}/todos",    [], 'jsonplaceholder');
+        $r4 = $this->fetch('GET', "{$base}/users/{$id}/albums",   [], 'jsonplaceholder');
+
+        $result = ['users' => count((array)$r1['body']), 'user_name' => $r2['body']['name'] ?? null, 'todos' => count((array)$r3['body']), 'albums' => count((array)$r4['body'])];
+        Logger::info('Users flow completed', $result);
+        return $result;
+    }
+
+    public function runGitHubFlow(): array
+    {
+        $repos = ['DataDog/dd-trace-php', 'DataDog/datadog-agent', 'DataDog/integrations-core', 'DataDog/documentation', 'DataDog/dd-sdk-android'];
+        $repo  = $repos[array_rand($repos)];
+        Logger::info('GitHub flow started', ['repo' => $repo]);
+
+        $r1 = $this->fetch('GET', "https://api.github.com/repos/{$repo}",                  [], 'github-api');
+        $r2 = $this->fetch('GET', "https://api.github.com/repos/{$repo}/contributors?per_page=5", [], 'github-api');
+        $r3 = $this->fetch('GET', "https://api.github.com/repos/{$repo}/releases/latest",  [], 'github-api');
+
+        $result = ['repo' => $repo, 'stars' => $r1['body']['stargazers_count'] ?? null, 'language' => $r1['body']['language'] ?? null, 'contributors' => count((array)$r2['body']), 'latest_release' => $r3['body']['tag_name'] ?? 'n/a'];
+        Logger::info('GitHub flow completed', $result);
+        return $result;
+    }
+
+    public function runCryptoFlow(): array
+    {
+        $coins = ['bitcoin', 'ethereum', 'solana', 'cardano', 'polkadot'];
+        $coin  = $coins[array_rand($coins)];
+        Logger::info('Crypto flow started', ['coin' => $coin]);
+
+        $r1 = $this->fetch('GET', 'https://api.coingecko.com/api/v3/ping',                                                 [], 'coingecko');
+        $r2 = $this->fetch('GET', "https://api.coingecko.com/api/v3/simple/price?ids={$coin}&vs_currencies=usd,mxn,eur",  [], 'coingecko');
+
+        $result = ['coin' => $coin, 'ping' => $r1['body']['gecko_says'] ?? 'ok', 'price_usd' => $r2['body'][$coin]['usd'] ?? null, 'price_mxn' => $r2['body'][$coin]['mxn'] ?? null];
+        Logger::info('Crypto flow completed', $result);
+        return $result;
+    }
+
+    public function runHttpBinFlow(): array
+    {
+        Logger::info('HTTPBin flow started');
+
+        $r1 = $this->fetch('GET',  'https://httpbin.org/uuid',   [], 'httpbin');
+        $r2 = $this->fetch('GET',  'https://httpbin.org/ip',     [], 'httpbin');
+        $r3 = $this->fetch('GET',  'https://httpbin.org/headers',[], 'httpbin');
+        $r4 = $this->fetch('POST', 'https://httpbin.org/post',   ['service' => 'kredit-plus', 'ts' => time()], 'httpbin');
+        $r5 = $this->fetch('PUT',  'https://httpbin.org/put',    ['key' => 'value'], 'httpbin');
+
+        $result = ['uuid' => $r1['body']['uuid'] ?? null, 'origin' => $r2['body']['origin'] ?? null, 'post_ok' => isset($r4['body']['json']), 'put_ok' => isset($r5['body']['json'])];
+        Logger::info('HTTPBin flow completed', $result);
+        return $result;
+    }
+
+    public function runQuotesFlow(): array
+    {
+        Logger::info('Quotes flow started');
+
+        $r1 = $this->fetch('GET', 'https://api.quotable.io/random',                            [], 'quotable');
+        $r2 = $this->fetch('GET', 'https://api.quotable.io/quotes?tags=technology&limit=5',    [], 'quotable');
+        $r3 = $this->fetch('GET', 'https://api.quotable.io/authors?limit=5',                   [], 'quotable');
+
+        $result = ['quote' => $r1['body']['content'] ?? null, 'author' => $r1['body']['author'] ?? null, 'tech_quotes' => count((array)($r2['body']['results'] ?? [])), 'authors' => count((array)($r3['body']['results'] ?? []))];
+        Logger::info('Quotes flow completed', $result);
+        return $result;
+    }
+
+    public function runAllFlows(): array
+    {
+        $span = null;
+        if (extension_loaded('ddtrace')) {
+            $span = \DDTrace\start_span();
+            $span->name = 'flows.run_all';
+            $span->type = 'custom';
+            $span->meta['span.kind']   = 'internal';
+            $span->meta['flows.count'] = '6';
+        }
+        Logger::info('Running all flows sequentially');
+
+        $flows   = ['posts', 'users', 'github', 'crypto', 'httpbin', 'quotes'];
+        $results = [];
+        foreach ($flows as $name) {
+            try {
+                $method         = 'run' . ucfirst($name) . 'Flow';
+                $results[$name] = $this->$method();
+            } catch (\Throwable $e) {
+                $results[$name] = ['error' => $e->getMessage()];
+                Logger::error("Flow {$name} failed", ['error' => $e->getMessage()]);
+            }
+        }
+
+        if ($span) \DDTrace\close_span();
+        Logger::info('All flows completed', ['flows' => count($results)]);
+        return $results;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Error simulation
+    // ══════════════════════════════════════════════════════════════════════════
+
+    public function simulateTimeout(): void
+    {
+        $orig          = $this->timeout;
+        $this->timeout = 2; // 2s timeout on a 10s delay endpoint
+        Logger::warning('Simulating timeout (2s limit on 10s endpoint)');
+        try {
+            $this->fetch('GET', 'https://httpbin.org/delay/10', [], 'httpbin');
+        } finally {
+            $this->timeout = $orig;
+        }
+    }
+
+    public function simulateHttp500(): void
+    {
+        Logger::warning('Simulating HTTP 500 response');
+        $this->fetch('GET', 'https://httpbin.org/status/500', [], 'httpbin');
+    }
+
+    public function simulateDnsFailure(): void
+    {
+        $url = 'https://this-host-does-not-exist-at-all.invalid/api/v1';
+        Logger::warning('Simulating DNS failure', ['url' => $url]);
+        $this->fetch('GET', $url, [], 'unreachable-service');
+    }
+
+    public function simulateRetryBackoff(): array
+    {
+        $url      = 'https://httpbin.org/status/503';
+        $attempts = 0;
+
+        $span = null;
+        if (extension_loaded('ddtrace')) {
+            $span = \DDTrace\start_span();
+            $span->name = 'http.retry_flow';
+            $span->type = 'http';
+            $span->meta['span.kind']          = 'client';
+            $span->meta['simulation']         = 'retry-backoff';
+            $span->meta['retry.max_attempts'] = (string) $this->maxRetries;
+        }
+        $t = microtime(true);
+
+        try {
+            $this->withRetry(function() use ($url, &$attempts) {
+                $attempts++;
+                Logger::info("Retry attempt {$attempts}", ['url' => $url]);
+                $this->fetch('GET', $url, [], 'httpbin');
+            });
+            if ($span) { $span->meta['retry.attempts'] = (string) $attempts; }
+            return ['attempts' => $attempts, 'success' => true];
+        } catch (\Throwable $e) {
+            if ($span) {
+                $span->meta['error']           = 'true';
+                $span->meta['error.message']   = $e->getMessage();
+                $span->meta['retry.attempts']  = (string) $attempts;
+                $span->meta['duration_ms']     = (string) round((microtime(true) - $t) * 1000, 2);
+            }
+            Logger::error('Retry backoff exhausted', ['attempts' => $attempts, 'error' => $e->getMessage()]);
+            return ['attempts' => $attempts, 'exhausted' => true, 'error' => $e->getMessage()];
+        } finally {
+            if ($span) \DDTrace\close_span();
+        }
+    }
+}
