@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.local
+!.env.example
+
+# Deploy script (contains client-specific infra names)
+deploy.sh
