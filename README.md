@@ -211,9 +211,53 @@ La presencia de `dd.trace_id` confirma que el tracer PHP está activo.
 ## Estructura del repositorio
 
 ```
-support/
-  php-apm-demo/       # Código de la app demo (PHP 8.3 + Apache)
-  conf.yaml           # Configuración de referencia para el Datadog Agent (SQL Server check)
-  example.yaml        # Ejemplo mínimo de conf.yaml con correcciones anotadas
-  manual-jeynner-apm.md  # Guía de instrumentación (fuente de este README)
+.
+├── Dockerfile              # PHP 8.3 + Apache con tracer de Datadog instalado
+├── docker-compose.yml      # Entorno local: app + MySQL + Datadog Agent
+├── index.php               # Punto de entrada: router + UI web
+├── src/
+│   ├── Logger.php          # Logger JSON estructurado con correlación de trazas
+│   ├── Db.php              # Operaciones MySQL con spans manuales de APM
+│   └── Http.php            # Llamadas HTTP externas con spans + simulación de errores
+├── db/
+│   └── schema.sql          # Schema de la base de datos demo (customers, orders, products)
+├── build-push.sh           # Build de la imagen y push a Azure Container Registry
+├── teardown.sh             # Elimina todos los recursos de Azure del demo
+└── .env.example            # Variables de entorno requeridas
 ```
+
+### ¿Qué hace la aplicación?
+
+La app expone una UI web y una API REST que genera señales de observabilidad reales para Datadog:
+
+| Sección | Endpoints | Qué produce en Datadog |
+|---|---|---|
+| **Log Generation** | `POST /api/log/{level}` | Logs en todos los niveles (DEBUG → CRITICAL), excepciones simuladas |
+| **External API Flows** | `POST /api/flow/{name}` | Trazas de spans HTTP salientes hacia APIs públicas (JSONPlaceholder, GitHub, CoinGecko, HTTPBin, Quotable) |
+| **Database Operations** | `POST /api/db/{op}` | Spans de queries MySQL, incluyendo queries lentas y transacciones multi-paso |
+| **Error Simulation** | `POST /api/error/{type}` | Timeouts, HTTP 500, fallos DNS, retry con exponential backoff |
+
+### Componentes clave
+
+**`src/Logger.php`** — Escribe a `stdout` en JSON con los campos `dd.trace_id` y `dd.span_id` extraídos del tracer activo. Esto conecta automáticamente cada log con su traza en Datadog.
+
+**`src/Db.php`** — Abre y cierra spans manualmente con `\DDTrace\start_span()` / `\DDTrace\close_span()` en cada query, con metadatos (`db.statement`, `db.operation`, `peer.service`). El método `createRandomOrder()` genera una transacción con múltiples spans anidados para demostrar el flamegraph de APM.
+
+**`src/Http.php`** — Envuelve cada llamada `curl` en un span `http.client.request` con metadatos de URL, método y status code. Incluye simulaciones de errores reales: timeout, HTTP 500, DNS failure y retry con backoff exponencial.
+
+---
+
+## Correr localmente
+
+```bash
+cp .env.example .env
+# Edita .env con tu DD_API_KEY y DD_SITE
+
+docker compose up --build
+```
+
+La UI estará disponible en `http://localhost:8080`.
+
+La base de datos se inicializa automáticamente con el schema en `db/schema.sql`.
+
+> Con `docker-compose.yml` el agente corre como servicio local (no como sidecar de Azure). El comportamiento de APM es idéntico.
